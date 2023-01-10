@@ -1,4 +1,4 @@
-use crate::db::{DbConn, user_exists, save_user};
+use crate::db::{DbConn, user_exists, save_user, verify_user};
 use crate::models::{
     AppState, LoginRequest, OAuthRedirect, PasswordUpdateRequest, RegisterRequest,
 };
@@ -118,16 +118,38 @@ async fn register(
 // TODO: Create the endpoint for the email verification function.
 /// Endpoint for email verification
 async fn verify_email(
-    _conn: DbConn,
-    State(_session_store): State<MemoryStore>,
-    Path(token) : Path<String>
-) -> Result<AuthResult, Response> {
-    // TODO: Implement the email verification function
-    // You can use the token that was sent in the email to verify the email
-    // Once the email is verified, update the user in the DB
-    let t = urlencoding::decode(&token).expect("UTF-8");
-    println!("verifying email: {}", t);
-    Ok(AuthResult::Success)
+    mut conn: DbConn,
+    State(session_store): State<MemoryStore>,
+    Path(token): Path<String>,
+) -> Result<Redirect, Response> {
+    let decoded_token = urlencoding::decode(&token).expect("UTF-8");
+    let session_id = decoded_token.to_string();
+    let session = match session_store.load_session(session_id).await {
+        Ok(Some(session)) => session,
+        _ => return Err(AuthResult::Error("Could not get session".to_string()).into_response()),
+    };
+
+    let email: String = match session.get::<String>("email") {
+        Some(email) => email.to_string(),
+        _ => return Err(AuthResult::Error("Session does not contain email".to_string()).into_response()),
+    };
+
+    let verification_status: String = match session.get::<String>("verification_status") {
+        Some(verification_status) => verification_status.to_string(),
+        _ => return Err(AuthResult::Error("Session does not contain verification status".to_string()).into_response()),
+    };
+
+    if verification_status != "pending" {
+        return Err(AuthResult::Error("Email already verified".to_string()).into_response());
+    }
+
+    match verify_user(&mut conn, email.as_str()) {
+        Ok(_) => {
+            session_store.destroy_session(session);
+            return Ok(Redirect::to("/login"));
+        },
+        Err(_) => return Err(AuthResult::Error("Could not update user".to_string()).into_response()),
+    }
 }
 
 /// Endpoint used for the first OAuth step
