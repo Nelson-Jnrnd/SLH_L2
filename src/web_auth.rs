@@ -1,18 +1,21 @@
-use crate::db::DbConn;
+use crate::db::{DbConn, user_exists, save_user};
 use crate::models::{
     AppState, LoginRequest, OAuthRedirect, PasswordUpdateRequest, RegisterRequest,
 };
-use crate::user::UserDTO;
-use axum::extract::{Query, State};
+use crate::user::{AuthenticationMethod, User, UserDTO};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::Cookie;
 use axum_extra::extract::CookieJar;
-use axum_sessions::async_session::MemoryStore;
+use axum_sessions::async_session::{MemoryStore, Session, SessionStore};
 use serde_json::json;
 use std::error::Error;
+use diesel::PgJsonbExpressionMethods;
+use lettre::{Message, SmtpTransport, Transport};
+use lettre::transport::smtp::authentication::Credentials;
 
 /// Declares the different endpoints
 /// state is used to pass common structs to the endpoints
@@ -24,6 +27,7 @@ pub fn stage(state: AppState) -> Router {
         .route("/_oauth", get(oauth_redirect))
         .route("/password_update", post(password_update))
         .route("/logout", get(logout))
+        .route("/verify_email/:token", get(verify_email))
         .with_state(state)
 }
 
@@ -50,24 +54,81 @@ async fn login(
 /// POST /register
 /// BODY { "register_email": "email", "register_password": "password", "register_password2": "password" }
 async fn register(
-    _conn: DbConn,
-    State(_session_store): State<MemoryStore>,
+    mut conn: DbConn,
+    State(session_store): State<MemoryStore>,
     Json(register): Json<RegisterRequest>,
 ) -> Result<AuthResult, Response> {
-    // TODO: Implement the register function. The email must be verified by sending a link.
-    //       You can use the functions inside db.rs to add a new user to the DB.
-    let _email = register.register_email;
-    let _password = register.register_password;
+    let email = register.register_email.to_lowercase(); // Make sure the email is lowercase to avoid duplicates
+    let password = register.register_password;
 
-    // Once the user has been created, send a verification link by email
-    // If you need to store data between requests, you may use the session_store. You need to first
-    // create a new Session and store the variables. Then, you add the session to the session_store
-    // to get a session_id. You then store the session_id in a cookie.
+    // check if the email already exists in the db TODO uncomment
+    match user_exists(&mut conn, email.as_str()) {
+        Ok(_) => return Err(AuthResult::Error("Email already exists".to_string()).into_response()),
+        Err(_) => {},
+    }
+
+    // create a new user
+    let user = User::new(email.as_str(), password.as_str(), AuthenticationMethod::Password, false);
+    match save_user(&mut conn, user) {
+        Ok(_) => {},
+        Err(_) => return Err(AuthResult::Error("Could not save user".to_string()).into_response()),
+    }
+
+    // create a new session to store the verification status
+    let mut session = Session::new();
+    session.insert("email", email.clone());
+    session.insert("verification_status", "pending");
+
+    // add the session to the session store
+    let session_id = match session_store.store_session(session).await {
+        Ok(Some(id)) => id,
+        _ => return Err(AuthResult::Error("Could not store session".to_string()).into_response()),
+    };
+
+    // send the verification link to the user's email
+    // use your preferred email library here
+
+    let mail = Message::builder()
+        .from("no-reply@example.com".parse().unwrap())
+        .to(
+            format!("{} <{}>", email.split("@").collect::<Vec<_>>()[0], email)
+                .parse()
+                .unwrap())
+        .subject("Verify your email address")
+        .body(format!("Please follow the link to verify your email address: http://localhost:8000/verify_email/{}", urlencoding::encode(&session_id)))
+        .unwrap();
+
+    let creds = Credentials::new("bd51a3078e245f".to_string(), "89a416b171b64d".to_string());
+
+    // Open a remote connection to gmail
+    let mailer = SmtpTransport::builder_dangerous("smtp.mailtrap.io")
+        .credentials(creds)
+        .port(2525)
+        .build();
+
+    // Send the email
+    match mailer.send(&mail) {
+        Ok(_) => println!("Email sent successfully!"),
+        Err(e) => panic!("Could not send email: {:?}", e),
+    }
 
     Ok(AuthResult::Success)
 }
 
 // TODO: Create the endpoint for the email verification function.
+/// Endpoint for email verification
+async fn verify_email(
+    _conn: DbConn,
+    State(_session_store): State<MemoryStore>,
+    Path(token) : Path<String>
+) -> Result<AuthResult, Response> {
+    // TODO: Implement the email verification function
+    // You can use the token that was sent in the email to verify the email
+    // Once the email is verified, update the user in the DB
+    let t = urlencoding::decode(&token).expect("UTF-8");
+    println!("verifying email: {}", t);
+    Ok(AuthResult::Success)
+}
 
 /// Endpoint used for the first OAuth step
 /// GET /oauth/google
@@ -140,14 +201,16 @@ fn add_auth_cookie(jar: CookieJar, _user: &UserDTO) -> Result<CookieJar, Box<dyn
 
 enum AuthResult {
     Success,
+    Error(String),
 }
 
 /// Returns a status code and a JSON payload based on the value of the enum
 impl IntoResponse for AuthResult {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::Success => (StatusCode::OK, "Success"),
+            Self::Success => (StatusCode::OK, json!("Success")),
+            Self::Error(reason) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error":reason})),
         };
-        (status, Json(json!({ "res": message }))).into_response()
+        (status, Json(message)).into_response()
     }
 }
