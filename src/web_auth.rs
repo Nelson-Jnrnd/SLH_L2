@@ -1,8 +1,8 @@
-use crate::db::{DbConn, user_exists, save_user, verify_user};
+use crate::db::{DbConn, user_exists, save_user, verify_user, get_user};
 use crate::models::{
     AppState, LoginRequest, OAuthRedirect, PasswordUpdateRequest, RegisterRequest,
 };
-use crate::user::{AuthenticationMethod, User, UserDTO};
+use crate::user::{AuthenticationMethod::Password, User, UserDTO};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
@@ -13,9 +13,16 @@ use axum_extra::extract::CookieJar;
 use axum_sessions::async_session::{MemoryStore, Session, SessionStore};
 use serde_json::json;
 use std::error::Error;
+use time::{Duration, OffsetDateTime};
+use axum_extra::handler::HandlerCallWithExtractors;
 use diesel::PgJsonbExpressionMethods;
 use lettre::{Message, SmtpTransport, Transport};
 use lettre::transport::smtp::authentication::Credentials;
+use jsonwebtoken::{encode, Header, EncodingKey, Algorithm, TokenData};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::SaltString;
+
 
 /// Declares the different endpoints
 /// state is used to pass common structs to the endpoints
@@ -35,19 +42,40 @@ pub fn stage(state: AppState) -> Router {
 /// POST /login
 /// BODY { "login_email": "email", "login_password": "password" }
 async fn login(
-    _conn: DbConn,
+    mut _conn: DbConn,
     jar: CookieJar,
     Json(login): Json<LoginRequest>,
 ) -> Result<(CookieJar, AuthResult), Response> {
-    // TODO: Implement the login function. You can use the functions inside db.rs to check if
-    //       the user exists and get the user info.
-    let _email = login.login_email;
-    let _password = login.login_password;
 
-    // Once the user has been created, authenticate the user by adding a JWT cookie in the cookie jar
-    // let jar = add_auth_cookie(jar, &user_dto)
-    //     .or(Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
-    return Ok((jar, AuthResult::Success));
+    let email = login.login_email.to_lowercase();
+    let password = login.login_password;
+
+    // check if the user exists in the db
+    let user = match get_user(&mut _conn, email.as_str()) {
+        Ok(user_dto) => user_dto,
+        Err(_) => return Err(AuthResult::Error("Invalid credentials".to_string()).into_response()),
+    };
+
+    // check if the password is correct if the user is using the password authentication method
+    if user.get_auth_method() == Password {
+        // TODO check if the password is correct using Argon2
+        let hash = match PasswordHash::new(&user.password.as_str()) {
+            Ok(hash) => hash,
+            Err(_) => return Err(AuthResult::Error("Saved Password is invalid".to_string()).into_response()),
+        };
+        Argon2::default().verify_password(password.as_bytes(), &hash).or(Err(AuthResult::Error("Invalid credentials".to_string())));
+    }
+
+    // check if the email is verified
+    if !user.email_verified {
+        return Err(AuthResult::Error("Email not verified".to_string()).into_response());
+    }
+
+    // authenticate the user by adding a JWT cookie in the cookie jar
+    let jar = add_auth_cookie(jar, &user.to_dto())
+        .or(Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
+    println!("User logged in !");
+    Ok((jar, AuthResult::Success))
 }
 
 /// Endpoint used to register a new account
@@ -67,8 +95,11 @@ async fn register(
         Err(_) => {},
     }
 
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default().hash_password(password.as_bytes(), &salt).unwrap().to_string();
+
     // create a new user
-    let user = User::new(email.as_str(), password.as_str(), AuthenticationMethod::Password, false);
+    let user = User::new(email.as_str(), hash.as_str(), Password, false);
     match save_user(&mut conn, user) {
         Ok(_) => {},
         Err(_) => return Err(AuthResult::Error("Could not save user".to_string()).into_response()),
@@ -215,10 +246,21 @@ async fn logout(jar: CookieJar) -> impl IntoResponse {
 
 #[allow(dead_code)]
 fn add_auth_cookie(jar: CookieJar, _user: &UserDTO) -> Result<CookieJar, Box<dyn Error>> {
-    // TODO: You have to create a new signed JWT and store it in the auth cookie.
-    //       Careful with the cookie options.
-    let jwt = "JWT";
-    Ok(jar.add(Cookie::build("auth", jwt).finish()))
+    let expires_in = Duration::weeks(1);
+    let expires = OffsetDateTime::now_utc() + expires_in;
+
+    let jwt = encode(
+        &Header::default(),
+        _user,
+        &EncodingKey::from_secret("secret".as_ref())
+    )?;
+
+    Ok(jar.add(Cookie::build("auth", jwt)
+        .expires(expires)
+        .secure(true)
+        .http_only(true)
+        .finish())
+    )
 }
 
 enum AuthResult {
