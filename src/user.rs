@@ -3,6 +3,7 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use strum_macros::{Display, EnumString};
+use time::{Duration, OffsetDateTime};
 
 #[derive(Display, EnumString, Serialize, Deserialize, PartialEq)]
 pub enum AuthenticationMethod {
@@ -22,6 +23,7 @@ pub struct User {
 pub struct UserDTO {
     pub email: String,
     pub auth_method: AuthenticationMethod,
+    pub exp: usize
 }
 
 impl User {
@@ -45,9 +47,13 @@ impl User {
     }
 
     pub fn to_dto(&self) -> UserDTO {
+        let expires_in = Duration::weeks(1);
+        let expires = OffsetDateTime::now_utc() + expires_in;
+
         UserDTO {
             email: self.email.clone(),
             auth_method: self.get_auth_method(),
+            exp: expires.unix_timestamp() as usize,
         }
     }
 }
