@@ -95,6 +95,17 @@ async fn register(
         Err(_) => {},
     }
 
+    // check if the password length is within the allowed range
+    if password.len() < 8 || password.len() > 64 {
+        return Err(AuthResult::Error("Password must be between 8 and 64 characters".to_string()).into_response());
+    }
+
+    // check if the password is strong enough using zxcvbn
+    let password_strength = zxcvbn::zxcvbn(password.as_str(), &[]).unwrap();
+    if password_strength.score() < 3 {
+        return Err(AuthResult::Error("Password is not strong enough".to_string()).into_response());
+    }
+
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default().hash_password(password.as_bytes(), &salt).unwrap().to_string();
 
@@ -256,6 +267,7 @@ fn add_auth_cookie(jar: CookieJar, _user: &UserDTO) -> Result<CookieJar, Box<dyn
     )?;
 
     Ok(jar.add(Cookie::build("auth", jwt)
+        .path("/")
         .expires(expires)
         .secure(true)
         .http_only(true)
@@ -272,8 +284,8 @@ enum AuthResult {
 impl IntoResponse for AuthResult {
     fn into_response(self) -> Response {
         let (status, message) = match self {
-            Self::Success => (StatusCode::OK, json!("Success")),
-            Self::Error(reason) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error":reason})),
+            Self::Success => (StatusCode::OK, json!({"res":"Success"})),
+            Self::Error(reason) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"res": format!("error {}", reason)})),
         };
         (status, Json(message)).into_response()
     }

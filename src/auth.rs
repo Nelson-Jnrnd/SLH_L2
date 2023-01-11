@@ -6,6 +6,7 @@ use axum::http::request::Parts;
 use axum::response::Redirect;
 use axum::RequestPartsExt;
 use axum_extra::extract::CookieJar;
+use jsonwebtoken::{decode, DecodingKey, Validation};
 
 const REDIRECT_URL: &str = "/home";
 
@@ -21,12 +22,22 @@ impl<S> FromRequestParts<S> for UserDTO
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // TODO: You have to read the auth cookie and verify the JWT to ensure the user is
         //       authenticated.
+        println!("yo");
         let jar = parts
             .extract::<CookieJar>()
             .await
             .expect("Could not get CookieJar from request parts");
         let _jwt = jar.get("auth").ok_or(Redirect::to(REDIRECT_URL))?.value();
-
-        Err(Redirect::to(REDIRECT_URL))
+        println!("jwt: {}", _jwt);
+        return match decode::<UserDTO>(&_jwt, &DecodingKey::from_secret("secret".as_ref()), &Validation::default()) {
+            Ok(user) => {
+                println!("User email is : {:?}", user.claims.email);
+                Ok(user.claims)
+            },
+            Err(err) => {
+                println!("Error decoding JWT : {:?}", err);
+                Err(Redirect::to(REDIRECT_URL))
+            },
+        }
     }
 }
