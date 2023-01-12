@@ -8,9 +8,12 @@ use serde::{Deserialize, Serialize};
 /// Lazy is used to initialize a complex static variable as it is currently not supported in native Rust.
 /// The initialization is done only once when the variable is used for the first time.  
 pub static OAUTH_CLIENT: Lazy<BasicClient> = Lazy::new(|| {
-    // TODO: We currently hardcode the credentials, try to improve it.
-    let google_client_id = ClientId::new("GOOGLE_CLIENT_ID".to_string());
-    let google_client_secret = ClientSecret::new("GOOGLE_CLIENT_SECRET".to_string());
+
+    let env_id = std::env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID not set");
+    let env_secret = std::env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET not set");
+
+    let google_client_id = ClientId::new(env_id);
+    let google_client_secret = ClientSecret::new(env_secret);
 
     let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
         .expect("Invalid authorization endpoint URL");

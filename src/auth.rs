@@ -22,22 +22,17 @@ impl<S> FromRequestParts<S> for UserDTO
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // TODO: You have to read the auth cookie and verify the JWT to ensure the user is
         //       authenticated.
-        println!("yo");
         let jar = parts
             .extract::<CookieJar>()
             .await
             .expect("Could not get CookieJar from request parts");
         let _jwt = jar.get("auth").ok_or(Redirect::to(REDIRECT_URL))?.value();
-        println!("jwt: {}", _jwt);
-        return match decode::<UserDTO>(&_jwt, &DecodingKey::from_secret("secret".as_ref()), &Validation::default()) {
-            Ok(user) => {
-                println!("User email is : {:?}", user.claims.email);
-                Ok(user.claims)
-            },
-            Err(err) => {
-                println!("Error decoding JWT : {:?}", err);
-                Err(Redirect::to(REDIRECT_URL))
-            },
+
+        let jwt_secret = std::env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY not set");
+
+        return match decode::<UserDTO>(&_jwt, &DecodingKey::from_secret(jwt_secret.as_ref()), &Validation::default()) {
+            Ok(user) => Ok(user.claims),
+            Err(_) => Err(Redirect::to(REDIRECT_URL)),
         }
     }
 }

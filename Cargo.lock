@@ -103,6 +103,7 @@ dependencies = [
  "diesel_migrations",
  "dotenv",
  "handlebars",
+ "hyper",
  "jsonwebtoken",
  "lettre",
  "oauth2",
