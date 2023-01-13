@@ -62,28 +62,27 @@ async fn login(
     // check if the user exists in the db
     let user = match get_user(&mut _conn, email.as_str()) {
         Ok(user_dto) => user_dto,
-        Err(_) => return Err(AuthResult::Error("Invalid credentials".to_string()).into_response()),
+        Err(_) => return Err(AuthResult::InvalidCredentials("Invalid credentials".to_string()).into_response()),
     };
 
     // check if the password is correct if the user is using the password authentication method
     if user.get_auth_method() == Password {
-        // TODO check if the password is correct using Argon2
         let hash = match PasswordHash::new(&user.password.as_str()) {
             Ok(hash) => hash,
-            Err(_) => return Err(AuthResult::Error("Saved Password is invalid".to_string()).into_response()),
+            Err(_) => return Err(AuthResult::InternalError("Saved Password is invalid".to_string()).into_response()),
         };
-        Argon2::default().verify_password(password.as_bytes(), &hash).or(Err(AuthResult::Error("Invalid credentials".to_string())));
+        Argon2::default().verify_password(password.as_bytes(), &hash)
+            .or(Err(AuthResult::InvalidCredentials("Invalid credentials".to_string())));
     }
 
     // check if the email is verified
     if !user.email_verified {
-        return Err(AuthResult::Error("Email not verified".to_string()).into_response());
+        return Err(AuthResult::NotVerified("Email not verified".to_string()).into_response());
     }
 
     // authenticate the user by adding a JWT cookie in the cookie jar
-    let jar = add_auth_cookie(jar, &user.to_dto())
-        .or(Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()))?;
-    Ok((jar, AuthResult::Success))
+    Ok((add_auth_cookie(jar, &user.to_dto())
+             .or(Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())).unwrap(), AuthResult::Success))
 }
 
 /// Endpoint used to register a new account
@@ -97,21 +96,15 @@ async fn register(
     let email = register.register_email.to_lowercase(); // Make sure the email is lowercase to avoid duplicates
     let password = register.register_password;
 
-    // check if the email already exists in the db TODO uncomment
+    // check if the email already exists in the db
     match user_exists(&mut conn, email.as_str()) {
-        Ok(_) => return Err(AuthResult::Error("Email already exists".to_string()).into_response()),
-        Err(_) => {},
+        Ok(_) => return Err(AuthResult::AlreadyExists("Email already exists".to_string()).into_response()),
+        Err(_) => {}
     }
 
-    // check if the password length is within the allowed range
-    if password.len() < 8 || password.len() > 64 {
-        return Err(AuthResult::Error("Password must be between 8 and 64 characters".to_string()).into_response());
-    }
-
-    // check if the password is strong enough using zxcvbn
-    let password_strength = zxcvbn::zxcvbn(password.as_str(), &[]).unwrap();
-    if password_strength.score() < 3 {
-        return Err(AuthResult::Error("Password is not strong enough".to_string()).into_response());
+    match is_password_valid(&password, &[email.as_str()]) {
+        Ok(_) => {}
+        Err(e) => return Err(AuthResult::PasswordSetInvalid(e.to_string()).into_response()),
     }
 
     let salt = SaltString::generate(&mut OsRng);
@@ -121,7 +114,7 @@ async fn register(
     let user = User::new(email.as_str(), hash.as_str(), Password, false);
     match save_user(&mut conn, user) {
         Ok(_) => {},
-        Err(_) => return Err(AuthResult::Error("Could not save user".to_string()).into_response()),
+        Err(_) => return Err(AuthResult::InternalError("Could not save user".to_string()).into_response()),
     }
 
     // create a new session to store the verification status
@@ -132,7 +125,7 @@ async fn register(
     // add the session to the session store
     let session_id = match session_store.store_session(session).await {
         Ok(Some(id)) => id,
-        _ => return Err(AuthResult::Error("Could not store session".to_string()).into_response()),
+        _ => return Err(AuthResult::InternalError("Could not store session".to_string()).into_response()),
     };
 
     // send the verification link to the user's email
@@ -148,13 +141,13 @@ async fn register(
         .body(format!("Here is your link my friend ! : http://localhost:8000/verify_email/{}", urlencoding::encode(&session_id)))
         .unwrap();
 
-    let username = std::env::var("MAILER_USERNAME")
+    let username = env::var("MAILER_USERNAME")
         .expect("MAILER_USERNAME must be set");
-    let password = std::env::var("MAILER_PASSWORD")
+    let password = env::var("MAILER_PASSWORD")
         .expect("MAILER_PASSWORD must be set");
-    let host = std::env::var("MAILER_HOST")
+    let host = env::var("MAILER_HOST")
         .expect("MAILER_HOST must be set");
-    let port = std::env::var("MAILER_PORT")
+    let port = env::var("MAILER_PORT")
         .expect("MAILER_PORT must be set")
         .parse::<u16>()
         .expect("MAILER_PORT must be a valid port number");
@@ -169,14 +162,11 @@ async fn register(
 
     // Send the email
     match mailer.send(&mail) {
-        Ok(_) => println!("Email sent successfully!"),
-        Err(e) => panic!("Could not send email: {:?}", e),
+        Ok(_) => Ok(AuthResult::Success),
+        Err(e) => Err(AuthResult::InternalError(e.to_string()).into_response()),
     }
-
-    Ok(AuthResult::Success)
 }
 
-// TODO: Create the endpoint for the email verification function.
 /// Endpoint for email verification
 async fn verify_email(
     mut conn: DbConn,
@@ -187,21 +177,21 @@ async fn verify_email(
     let session_id = decoded_token.to_string();
     let session = match session_store.load_session(session_id).await {
         Ok(Some(session)) => session,
-        _ => return Err(AuthResult::Error("Could not get session".to_string()).into_response()),
+        _ => return Err(AuthResult::InternalError("Could not get session".to_string()).into_response()),
     };
 
     let email: String = match session.get::<String>("email") {
         Some(email) => email.to_string(),
-        _ => return Err(AuthResult::Error("Session does not contain email".to_string()).into_response()),
+        _ => return Err(AuthResult::InternalError("Session does not contain email".to_string()).into_response()),
     };
 
     let verification_status: String = match session.get::<String>("verification_status") {
         Some(verification_status) => verification_status.to_string(),
-        _ => return Err(AuthResult::Error("Session does not contain verification status".to_string()).into_response()),
+        _ => return Err(AuthResult::InternalError("Session does not contain verification status".to_string()).into_response()),
     };
 
     if verification_status != "pending" {
-        return Err(AuthResult::Error("Email already verified".to_string()).into_response());
+        return Err(AuthResult::AlreadyVerified("Email already verified".to_string()).into_response());
     }
 
     match verify_user(&mut conn, email.as_str()) {
@@ -209,7 +199,7 @@ async fn verify_email(
             session_store.destroy_session(session);
             return Ok(Redirect::to("/login"));
         },
-        Err(_) => return Err(AuthResult::Error("Could not update user".to_string()).into_response()),
+        Err(_) => return Err(AuthResult::InternalError("Could not update user".to_string()).into_response()),
     }
 }
 
@@ -219,7 +209,7 @@ async fn google_oauth(
     jar: CookieJar,
     State(_session_store): State<MemoryStore>,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
-    let client = crate::oauth::OAUTH_CLIENT.clone();
+    let client = &crate::oauth::OAUTH_CLIENT;
 
     // Generate a random challenge
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
@@ -242,19 +232,21 @@ async fn google_oauth(
         _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    let env_expriation_time_hours = env::var("JWT_EXPIRATION_TIME_HOURS")
+    let env_expiration_time_hours = env::var("JWT_EXPIRATION_TIME_HOURS")
         .expect("JWT_EXPIRATION_TIME_HOURS must be set")
         .parse::<i64>()
         .expect("JWT_EXPIRATION_TIME_HOURS must be an integer");
 
     // Store the session id in a cookie
-    // Redirect the user to the Google OAuth form
-    Ok((jar.add(Cookie::build("session_id", session_id)
+    let jar = jar.add(Cookie::build("session_id", session_id)
         .path("/")
-        .expires(OffsetDateTime::now_utc()+ Duration::hours(env_expriation_time_hours))
+        .expires(OffsetDateTime::now_utc()+ Duration::hours(env_expiration_time_hours))
         .secure(true)
         .http_only(true)
-        .finish()), Redirect::to(auth_url.as_str())))
+        .finish());
+
+    // Redirect the user to the Google OAuth form
+    Ok((jar, Redirect::to(auth_url.as_str())))
 }
 
 // Google user info
@@ -274,8 +266,12 @@ async fn oauth_redirect(
     mut _conn: DbConn,
     _params: Query<OAuthRedirect>,
 ) -> Result<(CookieJar, Redirect), StatusCode> {
+
     // Retrieve the session_id cookie
-    let session_id_cookie = jar.get("session_id").ok_or(StatusCode::BAD_REQUEST)?;
+    let session_id_cookie = match jar.get("session_id") {
+        Some(cookie) => cookie,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
 
     // Retrieve the session from the session store
     let session =
@@ -292,19 +288,19 @@ async fn oauth_redirect(
             .set_pkce_verifier(verifier)
             .request_async(async_http_client).await.or(Err(StatusCode::INTERNAL_SERVER_ERROR))?;
 
-
     // Retrieve the email address from the token result
-    let email = get_google_oauth_email(&token_result).await.or(Err(StatusCode::UNAUTHORIZED))?;
+    let email = get_google_oauth_email(&token_result).await.or(Err(StatusCode::BAD_REQUEST))?;
 
     // Check if the user exists in the database
     let user_dto = match get_user(&mut _conn, email.clone().as_str()) {
         Ok(user) => {
             if user.get_auth_method() != OAuth {
-                return Err(StatusCode::UNAUTHORIZED);
+                return Err(StatusCode::BAD_REQUEST);
             }
             user.to_dto()
         },
         Err(_) => {
+            println!("User does not exist, creating new user");
             // If the user does not exist, create a new user
             let user = User::new(email.as_str(), "", OAuth, true);
             let user_dto = user.to_dto();
@@ -327,39 +323,33 @@ async fn password_update(
 ) -> Result<AuthResult, Response> {
 
     if _update.old_password == _update.new_password {
-        return Err(AuthResult::Error("New password must be different from old password".to_string()).into_response());
+        return Err(AuthResult::InternalError("New password must be different from old password".to_string()).into_response());
     }
 
-    let user = get_user(&mut _conn, _user.email.as_str()).or(Err(AuthResult::Error("Could not find user".to_string()).into_response()))?;
+    let user = get_user(&mut _conn, _user.email.as_str()).or(Err(AuthResult::InternalError("Could not find user".to_string()).into_response()))?;
 
     if user.get_auth_method() != Password {
-        return Err(AuthResult::Error("User does not have a password".to_string()).into_response());
+        return Err(AuthResult::InternalError("User does not have a password".to_string()).into_response());
     }
 
     let hash = match PasswordHash::new(&user.password.as_str()) {
         Ok(hash) => hash,
-        Err(_) => return Err(AuthResult::Error("Saved Password is invalid".to_string()).into_response()),
+        Err(_) => return Err(AuthResult::InternalError("Saved Password is invalid".to_string()).into_response()),
     };
-    Argon2::default().verify_password(_update.old_password.as_bytes(), &hash).or(Err(AuthResult::Error("Invalid credentials".to_string())));
+    Argon2::default().verify_password(_update.old_password.as_bytes(), &hash).or(Err(AuthResult::InternalError("Invalid credentials".to_string())));
 
-    // check if the password length is within the allowed range
-    if _update.new_password.len() < 8 || _update.new_password.len() > 64 {
-        return Err(AuthResult::Error("Password must be between 8 and 64 characters".to_string()).into_response());
-    }
 
-    // check if the password is strong enough using zxcvbn
-    let password_strength = zxcvbn::zxcvbn(_update.new_password.as_str(), &[]).unwrap();
-    if password_strength.score() < 3 {
-        return Err(AuthResult::Error("Password is not strong enough".to_string()).into_response());
+    match is_password_valid(_update.new_password.as_str(), &[]) {
+        Ok(_) => {},
+        Err(e) => return Err(AuthResult::PasswordSetInvalid(e.to_string()).into_response()),
     }
 
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default().hash_password(_update.new_password.as_bytes(), &salt).unwrap().to_string();
 
-
     match update_password(&mut _conn, &_user.email, &hash) {
         Ok(_) => Ok(AuthResult::Success),
-        Err(_) => Err(AuthResult::Error("Could not update password".to_string()).into_response()),
+        Err(_) => Err(AuthResult::InternalError("Could not update password".to_string()).into_response()),
     }
 }
 
@@ -397,9 +387,30 @@ fn add_auth_cookie(jar: CookieJar, _user: &UserDTO) -> Result<CookieJar, Box<dyn
     )
 }
 
+
+fn is_password_valid<'a, 'b, 'c, 'd>(_password: &'a str, _user_inputs: &'b[&'c str]) -> Result<(), &'d str> {
+    // check if the password length is within the allowed range
+    if _password.len() < 8 || _password.len() > 64 {
+        return Err("password length is not within the allowed range (8-64 characters)");
+    }
+
+    // check if the password is strong enough using zxcvbn
+    let password_strength = zxcvbn::zxcvbn(_password, _user_inputs).unwrap();
+    if password_strength.score() < 3 {
+        return Err("password is not strong enough");
+    }
+
+    Ok(())
+}
+
 enum AuthResult {
     Success,
-    Error(String),
+    InternalError(String),
+    InvalidCredentials(String),
+    NotVerified(String),
+    AlreadyExists(String),
+    AlreadyVerified(String),
+    PasswordSetInvalid(String),
 }
 
 /// Returns a status code and a JSON payload based on the value of the enum
@@ -407,7 +418,12 @@ impl IntoResponse for AuthResult {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::Success => (StatusCode::OK, json!({"res":"Success"})),
-            Self::Error(reason) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"res": format!("error {}", reason)})),
+            Self::InternalError(_) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"res": "InternalError"})),
+            Self::InvalidCredentials(reason) => (StatusCode::UNAUTHORIZED, json!({"res": format!("error {}", reason)})),
+            Self::NotVerified(reason) => (StatusCode::FORBIDDEN, json!({"res": format!("error {}", reason)})),
+            Self::AlreadyExists(reason) => (StatusCode::CONFLICT, json!({"res": format!("error {}", reason)})),
+            Self::PasswordSetInvalid(reason) => (StatusCode::UNPROCESSABLE_ENTITY, json!({"res": format!("error {}", reason)})),
+            Self::AlreadyVerified(reason) => (StatusCode::GONE, json!({"res": format!("error {}", reason)})),
         };
         (status, Json(message)).into_response()
     }
